@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,7 +29,43 @@ jobs:
         run: pip install buildozer cython==0.29.36
 
       - name: Build APK
-        run: buildozer android debug
+        run: |
+          # ---- 第一次构建: 下载/解包所有依赖源码 ----
+          # (预期在 pyjnius 处失败: 官方 1.6.1 未适配 Cython 3.x 的 long 关键字)
+          buildozer android debug || true
+
+          # ---- 应用官方修复 kivy/pyjnius PR #753 ----
+          # 在 4 处函数中补上 "from ctypes import c_long as long"
+          python3 - <<'EOF'
+          import glob
+
+          patch_line = "from ctypes import c_long as long"
+          anchors = (
+              "cdef int index",
+              "cdef jclass j_class",
+              "cdef int sign_args_len = len(sign_args)",
+          )
+          paths = []
+          for name in ("jnius_conversion.pxi", "jnius_utils.pxi"):
+              paths += glob.glob("/home/runner/.buildozer/**/" + name,
+                                 recursive=True)
+          for path in paths:
+              src = open(path, encoding="utf-8").read()
+              if "c_long as long" in src:
+                  print("already patched:", path)
+                  continue
+              out = []
+              for line in src.splitlines(True):
+                  out.append(line)
+                  if line.strip() in anchors:
+                      indent = line[:len(line) - len(line.lstrip())]
+                      out.append(indent + patch_line + "\n")
+              open(path, "w", encoding="utf-8").write("".join(out))
+              print("patched:", path)
+          EOF
+
+          # ---- 第二次构建: 继续编译并产出 APK ----
+          buildozer android debug
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
