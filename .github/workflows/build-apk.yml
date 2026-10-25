@@ -46,9 +46,12 @@ jobs:
               "cdef int sign_args_len = len(sign_args)",
           )
           paths = []
-          for name in ("jnius_conversion.pxi", "jnius_utils.pxi"):
-              paths += glob.glob("/home/runner/.buildozer/**/" + name,
-                                 recursive=True)
+          for base in (".buildozer",
+                       "/home/runner/work/nfc-app/nfc-app/.buildozer",
+                       "/home/runner/.buildozer"):
+              for name in ("jnius_conversion.pxi", "jnius_utils.pxi"):
+                  paths += glob.glob(base + "/**/" + name, recursive=True)
+          print("found %d pxi files" % len(paths))
           for path in paths:
               src = open(path, encoding="utf-8").read()
               if "c_long as long" in src:
