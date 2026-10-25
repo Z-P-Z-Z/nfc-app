@@ -18,6 +18,11 @@ android.ndk = 26b
 android.archs = arm64-v8a, armeabi-v7a
 android.accept_sdk_license = True
 
+# 固定 python-for-android 版本: 2024.1.21 使用 Python 3.10 工具链,
+# 与 kivy 2.3.0 的预生成 C 代码兼容 (最新 p4a 用 Python 3.14 会编译失败)
+[p4a]
+branch = 2024.1.21
+
 orientation = portrait
 fullscreen = 0
 
