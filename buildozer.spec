@@ -14,7 +14,7 @@ requirements = python3,kivy==2.3.0,pyjnius==1.6.1,android
 android.permissions = NFC
 android.api = 34
 android.minapi = 24
-android.ndk = 26b
+android.ndk = 25b
 android.archs = arm64-v8a, armeabi-v7a
 android.accept_sdk_license = True
 
