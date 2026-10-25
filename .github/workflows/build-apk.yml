@@ -29,7 +29,12 @@ jobs:
         run: pip install buildozer cython==0.29.36
 
       - name: Build APK
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
         run: |
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
           # ---- 第一次构建: 下载/解包所有依赖源码 ----
           # (预期在 pyjnius 处失败: 官方 1.6.1 未适配 Cython 3.x 的 long 关键字)
           buildozer android debug || true
