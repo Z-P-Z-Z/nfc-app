@@ -5,7 +5,7 @@ package.name = nfchelper
 package.domain = org.xxpyhton
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
-version = 1.1.0
+version = 1.2.0
 
 # 依赖: android 模块由 python-for-android 提供 (on_new_intent 支持)
 requirements = python3,kivy==2.3.0,pyjnius==1.6.1,android
