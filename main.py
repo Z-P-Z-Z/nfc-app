@@ -1,400 +1,937 @@
 # -*- coding: utf-8 -*-
 """
-NFC 助手 —— Android NFC 读写 App
-技术栈: Python 3 + Kivy (界面) + pyjnius (调用安卓 NFC API)
+NFC 助手 v2 —— Android NFC 读写 App
+技术栈: Python 3.10 + Kivy 2.3.0 + pyjnius (调用安卓 NFC API)
 
-功能:
-  1. 读取模式: 靠近 NFC 标签时, 自动读取 UID 和 NDEF 数据(文本/网址等)
-  2. 写入模式: 输入文本或网址, 点击"写入"后, 靠近标签即完成写入
+设计要点
+  1. 启动加固: 任何初始化异常都显示在界面上并写入日志文件, 不再闪退
+  2. 日志落盘: /sdcard/Android/data/org.xxpyhton.nfchelper/files/nfc_log.txt
+  3. 中文字体: 自动加载安卓系统自带 CJK 字体, 避免方框乱码
+  4. 深色卡片式 UI
 """
+
+import os
+import sys
+import traceback
+import datetime
 
 from kivy.app import App
 from kivy.lang import Builder
+from kivy.clock import Clock
+from kivy.core.text import LabelBase
+from kivy.core.window import Window
+from kivy.core.clipboard import Clipboard
 from kivy.metrics import dp
-from kivy.properties import StringProperty, BooleanProperty
+from kivy.properties import StringProperty, BooleanProperty, ListProperty
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.popup import Popup
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.label import Label
 
-# ---------------------------------------------------------------
-# Android 环境检测 (桌面上运行时自动降级为演示模式)
-# ---------------------------------------------------------------
-ANDROID = False
+# ---------------------------------------------------------------------------
+# 早期日志 (不依赖 Kivy / jnius, 启动第一刻即可用)
+# ---------------------------------------------------------------------------
+LOG_LINES = []
+LOG_PATH = [None]
+
+
+def log(msg):
+    line = '[%s] %s' % (datetime.datetime.now().strftime('%H:%M:%S'), msg)
+    LOG_LINES.append(line)
+    del LOG_LINES[:-500]
+    try:
+        print(line)
+    except Exception:
+        pass
+    if LOG_PATH[0]:
+        try:
+            with open(LOG_PATH[0], 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+        except Exception:
+            pass
+
+
+def log_exc(prefix):
+    log('%s: %s' % (prefix, traceback.format_exc().replace('\n', ' | ')))
+
+
+# ---------------------------------------------------------------------------
+# 运行环境 / 安卓桥接 (延迟 + 容错, 失败不影响界面启动)
+# ---------------------------------------------------------------------------
 try:
-    from jnius import autoclass
-    from android import activity as p4a_activity
-    ANDROID = True
-except ImportError:
-    pass
+    from kivy.utils import platform as _platform
+    IS_ANDROID = (_platform == 'android')
+except Exception:
+    IS_ANDROID = False
 
-# NDEF well-known URI 前缀表 (按 Record Type Definition)
-URI_PREFIXES = [
-    "", "http://www.", "https://www.", "http://", "https://", "tel:", "mailto:",
-    "ftp://anonymous:anonymous@", "ftp://ftp.", "ftps://", "sftp://", "smb://",
-    "nfs://", "ftp://", "dav://", "news:", "telnet://", "imap:", "rtsp://",
-    "urn:", "pop:", "sip:", "sips:", "tftp:", "btspp://", "btl2cap://",
-    "btgoep://", "tcpobex://", "irdaobex://", "file://", "urn:epc:id:",
-    "urn:epc:tag:", "urn:epc:pat:", "urn:epc:raw:", "urn:epc:", "urn:nfc:",
+autoclass = None
+PythonActivity = None
+ActivityRef = None
+
+
+def _init_android_bridge():
+    """导入 jnius / android 模块并准备日志路径; 返回错误字符串(空串=成功)"""
+    global autoclass, PythonActivity, ActivityRef
+    if not IS_ANDROID:
+        return ''
+    try:
+        from jnius import autoclass as _autoclass
+        autoclass = _autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        log('PythonActivity 已加载')
+
+        try:
+            activity = PythonActivity.mActivity
+            target_dir = None
+            ext = activity.getExternalFilesDir(None)
+            if ext is not None:
+                target_dir = str(ext.getAbsolutePath())
+            if not target_dir:
+                target_dir = str(activity.getFilesDir().getAbsolutePath())
+            if not os.path.isdir(target_dir):
+                os.makedirs(target_dir, exist_ok=True)
+            LOG_PATH[0] = os.path.join(target_dir, 'nfc_log.txt')
+            log('日志文件: %s' % LOG_PATH[0])
+        except Exception:
+            log_exc('准备日志目录失败')
+
+        try:
+            from android import activity as _activity
+            ActivityRef = _activity
+            log('android.activity 已加载')
+        except Exception:
+            log_exc('android.activity 导入失败(读取仍可用)')
+        return ''
+    except Exception:
+        log_exc('安卓桥接初始化失败')
+        return traceback.format_exc()
+
+
+# 中文字体候选 (安卓系统自带, 无需打包字体文件)
+FONT_CANDIDATES = [
+    '/system/fonts/NotoSansSC-Regular.otf',
+    '/system/fonts/NotoSansCJK-Regular.ttc',
+    '/system/fonts/NotoSansHans-Regular.otf',
+    '/system/fonts/DroidSansFallback.ttf',
+    '/system/fonts/DroidSansChinese.ttf',
+    'C:/Windows/Fonts/msyh.ttc',
+    'C:/Windows/Fonts/msyh.ttf',
+    'C:/Windows/Fonts/simhei.ttf',
 ]
 
 
-class NfcManager:
-    """封装安卓 NFC 前台调度: 读取标签 UID / NDEF 内容, 向标签写入 NDEF"""
+def register_cjk_font():
+    """注册系统中文字体, 成功返回字体名, 失败返回 Roboto"""
+    for path in FONT_CANDIDATES:
+        try:
+            if os.path.exists(path):
+                LabelBase.register(name='CJK', fn_regular=path)
+                log('已加载中文字体: %s' % path)
+                return 'CJK'
+        except Exception:
+            log_exc('字体加载失败 %s' % path)
+    log('未找到中文字体, 使用默认字体')
+    return 'Roboto'
 
+
+# NDEF URI 前缀表 (NFC Forum URI Record Type Definition)
+URI_PREFIXES = [
+    '', 'http://www.', 'https://www.', 'http://', 'https://', 'tel:', 'mailto:',
+    'ftp://anonymous:anonymous@', 'ftp://ftp.', 'ftps://', 'sftp://', 'smb://',
+    'nfs://', 'ftp://', 'dav://', 'news:', 'telnet://', 'imap:', 'rtsp://',
+    'urn:', 'pop:', 'sip:', 'sips:', 'tftp:', 'btspp://', 'btl2cap://',
+    'btgoep://', 'tcpobex://', 'irdaobex://', 'file://', 'urn:epc:id:',
+    'urn:epc:tag:', 'urn:epc:pat:', 'urn:epc:raw:', 'urn:epc:', 'urn:nfc:',
+]
+
+
+# ---------------------------------------------------------------------------
+# NFC 逻辑
+# ---------------------------------------------------------------------------
+class NfcManager(object):
     def __init__(self, on_event):
-        """
-        on_event: 回调函数, 接收一个 dict:
-            {event: 'read'|'write'|'error', uid: str, records: [...], message: str}
-        """
         self.on_event = on_event
-        self.write_armed = False      # True = 下一个碰到的标签将被写入
+        self.ready = False
+        self.adapter = None
+        self.activity = None
+        self.write_armed = False
         self.write_text = ''
         self.write_url = ''
+        self._classes = {}
 
-        if not ANDROID:
-            return
+    # ---- 初始化 (由 App 在 on_start 调用, 异常不外抛) ----
+    def init(self):
+        if not IS_ANDROID or autoclass is None:
+            return False, '非安卓环境'
+        try:
+            c = self._classes
+            c['NfcAdapter'] = autoclass('android.nfc.NfcAdapter')
+            c['Intent'] = autoclass('android.content.Intent')
+            c['IntentFilter'] = autoclass('android.content.IntentFilter')
+            c['PendingIntent'] = autoclass('android.app.PendingIntent')
+            c['Ndef'] = autoclass('android.nfc.tech.Ndef')
+            c['NdefFormatable'] = autoclass('android.nfc.tech.NdefFormatable')
+            c['NdefRecord'] = autoclass('android.nfc.NdefRecord')
+            c['NdefMessage'] = autoclass('android.nfc.NdefMessage')
+            self.activity = PythonActivity.mActivity
+            self.adapter = c['NfcAdapter'].getDefaultAdapter(self.activity)
+            self.ready = True
+            log('NFC 适配器: %s' % ('已就绪' if self.adapter is not None else '无硬件'))
+            if ActivityRef is not None:
+                try:
+                    ActivityRef.bind(on_new_intent=self._on_new_intent)
+                    log('已绑定 on_new_intent 回调')
+                except Exception:
+                    log_exc('绑定 on_new_intent 失败')
+            return True, ''
+        except Exception:
+            log_exc('NFC 初始化失败')
+            return False, traceback.format_exc()
 
-        self.NfcAdapterCls = autoclass('android.nfc.NfcAdapter')
-        self.IntentCls = autoclass('android.content.Intent')
-        self.IntentFilterCls = autoclass('android.content.IntentFilter')
-        self.PendingIntentCls = autoclass('android.app.PendingIntent')
-        self.NdefCls = autoclass('android.nfc.tech.Ndef')
-        self.NdefFormatableCls = autoclass('android.nfc.tech.NdefFormatable')
-        self.NdefRecordCls = autoclass('android.nfc.NdefRecord')
-        self.NdefMessageCls = autoclass('android.nfc.NdefMessage')
-        self.PythonActivityCls = autoclass('org.kivy.android.PythonActivity')
+    def has_hardware(self):
+        return self.adapter is not None
 
-        self.activity = self.PythonActivityCls.mActivity
-        self.adapter = self.NfcAdapterCls.getDefaultAdapter(self.activity)
-
-        # 注册 "新 Intent" 回调 (标签靠近时系统派发)
-        p4a_activity.bind(on_new_intent=self._on_new_intent)
-
-    # ---------------- 对外接口 ----------------
-
-    def is_available(self):
-        """手机是否具备 NFC 硬件且已开启"""
-        if not ANDROID:
+    def is_enabled(self):
+        try:
+            return self.adapter is not None and bool(self.adapter.isEnabled())
+        except Exception:
+            log_exc('查询 NFC 状态失败')
             return False
-        return self.adapter is not None and self.adapter.isEnabled()
 
     def start(self):
-        """开启前台调度, 使 App 在前台时独占 NFC 事件"""
-        if not ANDROID or self.adapter is None:
+        """开启前台调度, 让 App 在前台时优先收到标签事件"""
+        if not self.ready or self.adapter is None:
             return
-        intent = self.IntentCls(self.activity, self.PythonActivityCls.getClass())
-        intent.setFlags(self.IntentCls.FLAG_ACTIVITY_SINGLE_TOP)
+        try:
+            c = self._classes
+            intent = c['Intent'](self.activity, PythonActivity.getClass())
+            intent.setFlags(c['Intent'].FLAG_ACTIVITY_SINGLE_TOP)
 
-        # Android 12+ 要求 PendingIntent 必须声明可变性
-        flags = self.PendingIntentCls.FLAG_UPDATE_CURRENT | self.PendingIntentCls.FLAG_MUTABLE
-        pending = self.PendingIntentCls.getActivity(self.activity, 0, intent, flags)
+            # Android 12+ 要求显式声明 PendingIntent 可变性
+            flags = c['PendingIntent'].FLAG_UPDATE_CURRENT
+            try:
+                flags = flags | c['PendingIntent'].FLAG_MUTABLE
+            except Exception:
+                pass
+            pending = c['PendingIntent'].getActivity(self.activity, 0, intent, flags)
 
-        ndef_filter = self.IntentFilterCls(self.NfcAdapterCls.ACTION_NDEF_DISCOVERED)
-        ndef_filter.addDataType('*/*')
-        tag_filter = self.IntentFilterCls(self.NfcAdapterCls.ACTION_TAG_DISCOVERED)
-        tag_filter.addCategory(self.IntentCls.CATEGORY_DEFAULT)
+            filters = []
+            try:
+                f = c['IntentFilter'](c['NfcAdapter'].ACTION_NDEF_DISCOVERED)
+                f.addDataType('*/*')
+                filters.append(f)
+            except Exception:
+                log_exc('构造 NDEF IntentFilter 失败')
+            try:
+                f2 = c['IntentFilter'](c['NfcAdapter'].ACTION_TAG_DISCOVERED)
+                f2.addCategory(c['Intent'].CATEGORY_DEFAULT)
+                filters.append(f2)
+            except Exception:
+                log_exc('构造 TAG IntentFilter 失败')
 
-        self.adapter.enableForegroundDispatch(
-            self.activity, pending, [ndef_filter, tag_filter], [])
+            self.adapter.enableForegroundDispatch(
+                self.activity, pending, filters, [])
+            log('前台调度已开启 (%d 个 filter)' % len(filters))
+        except Exception:
+            log_exc('开启前台调度失败')
 
     def stop(self):
-        if not ANDROID or self.adapter is None:
-            return
-        self.adapter.disableForegroundDispatch(self.activity)
+        try:
+            if self.ready and self.adapter is not None:
+                self.adapter.disableForegroundDispatch(self.activity)
+        except Exception:
+            log_exc('关闭前台调度失败')
 
     def arm_write(self, text='', url=''):
-        """武装写入: 下一个碰到的标签会被写入"""
         self.write_armed = True
         self.write_text = text or ''
         self.write_url = url or ''
         self.on_event({'event': 'info',
-                       'message': '已就绪，请将手机背面贴近 NFC 标签…'})
+                       'message': '已就绪，请把手机背面贴近 NFC 标签…'})
 
-    # ---------------- 内部实现 ----------------
-
+    # ---- 内部 ----
     def _on_new_intent(self, intent):
         try:
+            log('收到 NFC Intent')
             self._process_intent(intent)
-        except Exception as e:
-            self.on_event({'event': 'error', 'message': str(e)})
+        except Exception:
+            log_exc('处理 NFC 标签失败')
+            self.on_event({'event': 'error',
+                           'message': 'NFC 处理失败（详见日志）'})
 
     def _process_intent(self, intent):
-        tag = intent.getParcelableExtra(self.NfcAdapterCls.EXTRA_TAG)
+        c = self._classes
+        tag = intent.getParcelableExtra(c['NfcAdapter'].EXTRA_TAG)
         if tag is None:
             return
 
-        uid = bytes(tag.getId())
-        uid_hex = ':'.join('%02X' % b for b in uid)
+        try:
+            uid_hex = ':'.join('%02X' % b for b in bytes(tag.getId()))
+        except Exception:
+            uid_hex = '未知'
+        try:
+            techs = list(tag.getTechList()) or []
+            tech_list = ', '.join(t.split('.')[-1] for t in techs)
+        except Exception:
+            tech_list = ''
 
-        # ---- 写入模式 ----
         if self.write_armed:
             self.write_armed = False
             try:
-                target = self.write_url if self.write_url else self.write_text
                 self._write_tag(tag)
+                target = self.write_url or self.write_text
                 self.on_event({'event': 'write', 'uid': uid_hex,
-                               'message': '写入成功: %s' % target})
-            except Exception as e:
+                               'message': '已写入: %s' % target})
+            except Exception:
+                log_exc('写入失败')
+                msg = str(traceback.format_exc().strip().split('\n')[-1])
                 self.on_event({'event': 'error',
-                               'message': '写入失败: %s' % e})
+                               'message': '写入失败: %s' % msg})
             return
 
-        # ---- 读取模式 ----
         records = []
-        msgs = intent.getParcelableArrayExtra(self.NfcAdapterCls.EXTRA_NDEF_MESSAGES)
+        msgs = None
+        try:
+            msgs = intent.getParcelableArrayExtra(c['NfcAdapter'].EXTRA_NDEF_MESSAGES)
+        except Exception:
+            log_exc('读取 EXTRA_NDEF_MESSAGES 失败')
+
         if msgs:
             for m in msgs:
-                for rec in m.getRecords():
-                    records.append(self._parse_record(rec))
-            self.on_event({'event': 'read', 'uid': uid_hex,
-                           'records': records})
+                try:
+                    for rec in m.getRecords():
+                        records.append(self._parse_record(rec))
+                except Exception:
+                    log_exc('解析 NDEF 消息失败')
         else:
-            self.on_event({'event': 'read', 'uid': uid_hex,
-                           'records': [('提示', '该标签不含 NDEF 数据 (可能是空白卡或非 NDEF 卡)')]})
+            records = self._read_via_tech(tag)
+
+        self.on_event({'event': 'read', 'uid': uid_hex, 'tech': tech_list,
+                       'records': records})
+
+    def _read_via_tech(self, tag):
+        """Intent 里没有 NDEF 数据时, 直接连到标签读取缓存消息"""
+        c = self._classes
+        ndef = None
+        try:
+            ndef = c['Ndef'].get(tag)
+            if ndef is None:
+                return [('提示', '该标签不含 NDEF 数据（空白卡或非 NDEF 卡）')]
+            ndef.connect()
+            msg = ndef.getCachedNdefMessage()
+            if msg is None:
+                return [('提示', '标签已连接，但其中没有 NDEF 数据')]
+            return [self._parse_record(r) for r in msg.getRecords()]
+        except Exception:
+            log_exc('通过 Ndef 读取失败')
+            return [('提示', '读取 NDEF 内容失败，仅显示 UID')]
+        finally:
+            try:
+                if ndef is not None:
+                    ndef.close()
+            except Exception:
+                pass
 
     def _parse_record(self, rec):
-        """把一条 NdefRecord 解析成 (类型, 内容)"""
-        tnf = rec.getTnf()
+        tnf = 0
+        rtype = ''
         try:
+            tnf = rec.getTnf()
             rtype = bytes(rec.getType()).decode('ascii', 'replace')
         except Exception:
-            rtype = ''
-        payload = bytes(rec.getPayload())
+            pass
+        try:
+            payload = bytes(rec.getPayload())
+        except Exception:
+            payload = b''
 
-        if tnf == 1 and rtype == 'T':                       # 文本记录
-            status = payload[0]
-            lang_len = status & 0x3F
-            enc = 'utf-16-be' if (status & 0x80) else 'utf-8'
-            return ('文本', payload[1 + lang_len:].decode(enc, 'replace'))
+        try:
+            if tnf == 1 and rtype == 'T':
+                status = payload[0]
+                lang_len = status & 0x3F
+                enc = 'utf-16-be' if (status & 0x80) else 'utf-8'
+                return ('文本', payload[1 + lang_len:].decode(enc, 'replace'))
+            if tnf == 1 and rtype == 'U':
+                idx = payload[0]
+                prefix = URI_PREFIXES[idx] if idx < len(URI_PREFIXES) else ''
+                return ('网址', prefix + payload[1:].decode('utf-8', 'replace'))
+            if tnf == 0:
+                return ('空白', '(空记录)')
+            if tnf == 1 and rtype in ('Sp', 'Ss'):
+                return ('智能海报', payload.decode('utf-8', 'replace'))
+            if tnf == 2 and rtype == 'android.com:pkg':
+                return ('安卓应用', payload.decode('utf-8', 'replace'))
+        except Exception:
+            log_exc('解析单条记录失败')
 
-        if tnf == 1 and rtype == 'U':                       # 网址记录
-            idx = payload[0]
-            prefix = URI_PREFIXES[idx] if idx < len(URI_PREFIXES) else ''
-            return ('网址', prefix + payload[1:].decode('utf-8', 'replace'))
-
-        return ('数据', 'TNF=%s Type=%s Payload=%s…'
-                % (tnf, rtype, payload[:32].hex()))
+        return ('数据', 'TNF=%s  类型=%s\n十六进制: %s'
+                % (tnf, rtype or '(无)', payload[:48].hex() or '(空)'))
 
     def _write_tag(self, tag):
-        """把当前 write_text / write_url 写入标签"""
+        c = self._classes
         if self.write_url:
-            record = self.NdefRecordCls.createUri(self.write_url)
+            record = c['NdefRecord'].createUri(self.write_url)
         else:
-            record = self.NdefRecordCls.createTextRecord('zh', self.write_text)
-        message = self.NdefMessageCls([record])
+            record = c['NdefRecord'].createTextRecord('zh', self.write_text)
+        message = c['NdefMessage']([record])
+        size = message.getByteArrayLength()
 
-        ndef = self.NdefCls.get(tag)
+        ndef = c['Ndef'].get(tag)
         if ndef is not None:
             ndef.connect()
             try:
                 if not ndef.isWritable():
                     raise RuntimeError('标签已设为只读')
-                if ndef.getMaxSize() < message.getByteArrayLength():
-                    raise RuntimeError('标签容量不足 (容量 %d 字节)'
-                                       % ndef.getMaxSize())
+                max_size = ndef.getMaxSize()
+                if max_size < size:
+                    raise RuntimeError('标签容量不足 (需要 %d, 可用 %d 字节)'
+                                       % (size, max_size))
                 ndef.writeNdefMessage(message)
+                log('写入成功, %d 字节' % size)
             finally:
-                ndef.close()
+                try:
+                    ndef.close()
+                except Exception:
+                    pass
             return
 
-        # 标签存在但未格式化, 尝试格式化后写入
-        fmt = self.NdefFormatableCls.get(tag)
+        fmt = c['NdefFormatable'].get(tag)
         if fmt is not None:
             fmt.connect()
             try:
                 fmt.format(message)
+                log('格式化并写入成功, %d 字节' % size)
             finally:
-                fmt.close()
+                try:
+                    fmt.close()
+                except Exception:
+                    pass
             return
 
-        raise RuntimeError('该标签不支持 NDEF 写入')
+        raise RuntimeError('该标签不支持 NDEF 写入（可能是加密卡或只读卡）')
 
 
+# ---------------------------------------------------------------------------
+# 界面
+# ---------------------------------------------------------------------------
 KV = '''
+#:import dp kivy.metrics.dp
+
+<Card@BoxLayout>:
+    orientation: 'vertical'
+    size_hint_y: None
+    padding: dp(14), dp(12), dp(14), dp(12)
+    spacing: dp(9)
+    canvas.before:
+        Color:
+            rgba: 0.105, 0.118, 0.145, 1
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(16)]
+        Color:
+            rgba: 1, 1, 1, 0.06
+        Line:
+            rounded_rectangle: self.x, self.y, self.width, self.height, dp(16)
+            width: 1
+
+<Seg@ToggleButton>:
+    background_normal: ''
+    background_color: 0, 0, 0, 0
+    font_name: app.font_name
+    font_size: dp(15)
+    color: (1, 1, 1, 1) if self.state == 'down' else (0.62, 0.67, 0.76, 1)
+    canvas.before:
+        Color:
+            rgba: (0.24, 0.58, 1, 0.30) if self.state == 'down' else (1, 1, 1, 0.05)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(11)]
+        Color:
+            rgba: (0.32, 0.66, 1, 1) if self.state == 'down' else (0, 0, 0, 0)
+        Line:
+            rounded_rectangle: self.x, self.y, self.width, self.height, dp(11)
+            width: 1.1
+
+<Primary@Button>:
+    background_normal: ''
+    background_color: 0, 0, 0, 0
+    color: 1, 1, 1, 1
+    bold: True
+    font_name: app.font_name
+    font_size: dp(16)
+    canvas.before:
+        Color:
+            rgba: (0.24, 0.58, 1, 1) if self.state == 'normal' else (0.17, 0.42, 0.76, 1)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(13)]
+
+<Ghost@Button>:
+    background_normal: ''
+    background_color: 0, 0, 0, 0
+    color: 0.74, 0.78, 0.86, 1
+    font_name: app.font_name
+    font_size: dp(13)
+    canvas.before:
+        Color:
+            rgba: (1, 1, 1, 0.07) if self.state == 'normal' else (1, 1, 1, 0.15)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(10)]
+
+<Field@TextInput>:
+    background_color: 0, 0, 0, 0
+    foreground_color: 0.95, 0.96, 1, 1
+    hint_text_color: 0.45, 0.51, 0.60, 1
+    cursor_color: 0.32, 0.66, 1, 1
+    selection_color: 0.24, 0.58, 1, 0.35
+    font_name: app.font_name
+    font_size: dp(15)
+    padding: dp(13), dp(11), dp(13), dp(11)
+    multiline: False
+    write_tab: False
+    size_hint_y: None
+    height: dp(48)
+    canvas.before:
+        Color:
+            rgba: 0.062, 0.072, 0.094, 1
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
+        Color:
+            rgba: (0.30, 0.64, 1, 1) if self.focus else (1, 1, 1, 0.09)
+        Line:
+            rounded_rectangle: self.x, self.y, self.width, self.height, dp(12)
+            width: 1.1
+
 <Root>:
     orientation: 'vertical'
-    padding: dp(16)
+    padding: dp(16), 0, dp(16), dp(8)
     spacing: dp(10)
+    canvas.before:
+        Color:
+            rgba: 0.052, 0.059, 0.075, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
 
-    Label:
-        text: 'NFC 助手'
-        font_size: dp(26)
-        bold: True
+    # ---------------- 顶部标题 ----------------
+    BoxLayout:
+        orientation: 'vertical'
         size_hint_y: None
-        height: dp(40)
-        color: 0.15, 0.55, 0.95, 1
+        height: dp(66)
+        spacing: dp(2)
+        Label:
+            text: 'NFC 助手'
+            font_name: app.font_name
+            font_size: dp(23)
+            bold: True
+            color: 0.96, 0.97, 1, 1
+            text_size: self.size
+            halign: 'left'
+            valign: 'middle'
+        Label:
+            text: '读取 / 写入 NFC 标签'
+            font_name: app.font_name
+            font_size: dp(12.5)
+            color: 0.52, 0.58, 0.68, 1
+            text_size: self.size
+            halign: 'left'
+            valign: 'middle'
 
-    Label:
-        id: status
-        text: root.status
-        font_size: dp(15)
-        color: 0.9, 0.35, 0.1, 1
-        size_hint_y: None
-        height: dp(30)
-
+    # ---------------- 状态条 ----------------
     BoxLayout:
         size_hint_y: None
-        height: dp(48)
-        spacing: dp(10)
+        height: dp(50)
+        padding: dp(14), dp(6), dp(14), dp(6)
+        canvas.before:
+            Color:
+                rgba: root.banner_bg
+            RoundedRectangle:
+                pos: self.pos
+                size: self.size
+                radius: [dp(12)]
+        Label:
+            text: root.status_text
+            font_name: app.font_name
+            font_size: dp(13)
+            color: root.banner_fg
+            text_size: self.width, None
+            halign: 'left'
+            valign: 'middle'
 
-        ToggleButton:
-            id: btn_read
-            text: '读取模式'
-            group: 'mode'
-            state: 'down'
-            font_size: dp(16)
+    # ---------------- 模式切换 ----------------
+    BoxLayout:
+        size_hint_y: None
+        height: dp(46)
+        spacing: dp(10)
+        Seg:
+            text: '读取'
+            state: 'down' if not root.write_mode else 'normal'
             on_release: root.set_mode('read')
-        ToggleButton:
-            id: btn_write
-            text: '写入模式'
-            group: 'mode'
-            font_size: dp(16)
+        Seg:
+            text: '写入'
+            state: 'down' if root.write_mode else 'normal'
             on_release: root.set_mode('write')
 
-    # ---------- 写入区域 ----------
-    BoxLayout:
-        id: write_panel
-        orientation: 'vertical'
-        spacing: dp(8)
+    # ---------------- 写入面板 ----------------
+    Card:
         opacity: 1 if root.write_mode else 0
         disabled: not root.write_mode
-        height: dp(210) if root.write_mode else 0
-        size_hint_y: None
-
-        Label:
-            text: '写入文本:'
-            font_size: dp(14)
+        height: (dp(200) if root.write_mode else 0)
+        BoxLayout:
             size_hint_y: None
             height: dp(22)
-            color: 0.3, 0.3, 0.3, 1
-            text_size: self.size
-            halign: 'left'
-        TextInput:
+            Label:
+                text: '写入内容'
+                font_name: app.font_name
+                font_size: dp(13.5)
+                bold: True
+                color: 0.80, 0.84, 0.92, 1
+                text_size: self.size
+                halign: 'left'
+                valign: 'middle'
+            Label:
+                text: root.byte_hint
+                font_name: app.font_name
+                font_size: dp(11.5)
+                color: 0.45, 0.51, 0.62, 1
+                text_size: self.size
+                halign: 'right'
+                valign: 'middle'
+        Field:
             id: txt_input
-            hint_text: '例如: 你好，这是我的 NFC 名片'
-            multiline: False
-            font_size: dp(15)
+            hint_text: '文本，或以 http 开头的网址'
+            on_text: root.update_hint(self.text)
+        BoxLayout:
             size_hint_y: None
-            height: dp(44)
-        Label:
-            text: '或写入网址:'
-            font_size: dp(14)
-            size_hint_y: None
-            height: dp(22)
-            color: 0.3, 0.3, 0.3, 1
-            text_size: self.size
-            halign: 'left'
-        TextInput:
-            id: url_input
-            hint_text: '例如: https://example.com'
-            multiline: False
-            font_size: dp(15)
-            size_hint_y: None
-            height: dp(44)
-        Button:
-            id: btn_go
-            text: '写入下一个碰到的标签'
-            font_size: dp(16)
-            background_normal: ''
-            background_color: 0.15, 0.55, 0.95, 1
-            size_hint_y: None
-            height: dp(48)
-            on_release: root.arm_write()
+            height: dp(46)
+            spacing: dp(10)
+            Primary:
+                text: '写入下一个标签'
+                on_release: root.arm_write()
+            Ghost:
+                text: '清空'
+                size_hint_x: None
+                width: dp(72)
+                on_release: root.clear_inputs()
 
-    # ---------- 读取结果 ----------
-    Label:
-        text: '读取结果:'
-        font_size: dp(14)
-        size_hint_y: None
-        height: dp(22)
-        color: 0.3, 0.3, 0.3, 1
-        text_size: self.size
-        halign: 'left'
-    ScrollView:
-        Label:
-            id: output
-            text: root.output
-            font_size: dp(14)
-            color: 0.2, 0.2, 0.2, 1
+    # ---------------- 结果面板 ----------------
+    Card:
+        size_hint_y: 1
+        BoxLayout:
             size_hint_y: None
-            height: self.texture_size[1]
-            text_size: self.width, None
-            valign: 'top'
-            padding: dp(6)
+            height: dp(30)
+            spacing: dp(8)
+            Label:
+                text: root.result_title
+                font_name: app.font_name
+                font_size: dp(13.5)
+                bold: True
+                color: 0.80, 0.84, 0.92, 1
+                text_size: self.size
+                halign: 'left'
+                valign: 'middle'
+            Ghost:
+                text: '复制'
+                size_hint_x: None
+                width: dp(58)
+                height: dp(28)
+                on_release: root.copy_result()
+            Ghost:
+                text: '日志'
+                size_hint_x: None
+                width: dp(58)
+                height: dp(28)
+                on_release: root.show_log()
+        ScrollView:
+            do_scroll_x: False
+            bar_width: dp(3)
+            Label:
+                id: output
+                text: root.output_text
+                font_name: app.font_name
+                font_size: dp(14)
+                color: 0.86, 0.89, 0.95, 1
+                size_hint_y: None
+                height: self.texture_size[1] if self.texture_size[1] > dp(40) else dp(40)
+                text_size: self.width, None
+                valign: 'top'
+                halign: 'left'
 '''
 
 
 class Root(BoxLayout):
-    status = StringProperty('')
-    output = StringProperty('')
+    status_text = StringProperty('正在启动…')
+    status_kind = StringProperty('info')      # info / ok / err
+    banner_bg = ListProperty([0.16, 0.30, 0.52, 0.55])
+    banner_fg = ListProperty([0.78, 0.86, 1.0, 1.0])
+    output_text = StringProperty('')
+    result_title = StringProperty('读取结果')
     write_mode = BooleanProperty(False)
+    byte_hint = StringProperty('')
+
+    # ---- 交互 ----
+    def set_status(self, text, kind='info'):
+        self.status_text = text
+        self.status_kind = kind
+        if kind == 'ok':
+            self.banner_bg = [0.09, 0.40, 0.27, 0.60]
+            self.banner_fg = [0.62, 0.94, 0.76, 1]
+        elif kind == 'err':
+            self.banner_bg = [0.52, 0.15, 0.17, 0.60]
+            self.banner_fg = [1.0, 0.72, 0.72, 1]
+        else:
+            self.banner_bg = [0.15, 0.29, 0.50, 0.60]
+            self.banner_fg = [0.78, 0.86, 1.0, 1]
 
     def set_mode(self, mode):
         self.write_mode = (mode == 'write')
         if self.write_mode:
-            self.status = '写入模式: 填写内容后点击下方按钮'
+            self.result_title = '写入记录'
+            self.set_status('写入模式：填好内容后点「写入下一个标签」', 'info')
         else:
-            self.status = '读取模式: 请贴近 NFC 标签'
+            self.result_title = '读取结果'
+            app = App.get_running_app()
+            if getattr(app, 'nfc_ready', False):
+                self.set_status('读取模式：把标签贴到手机背面即可', 'info')
+            else:
+                self.set_status('NFC 不可用：请确认手机支持并已开启 NFC', 'err')
+
+    def update_hint(self, text):
+        text = (text or '').strip()
+        if not text:
+            self.byte_hint = ''
+        elif text.startswith('http://') or text.startswith('https://'):
+            self.byte_hint = '按网址写入'
+        else:
+            self.byte_hint = '约 %d 字节' % (len(text.encode('utf-8')) + 7)
+
+    def clear_inputs(self):
+        self.ids.txt_input.text = ''
+        self.byte_hint = ''
 
     def arm_write(self):
-        txt = self.ids.txt_input.text.strip()
-        url = self.ids.url_input.text.strip()
-        if not txt and not url:
-            self.status = '请先输入要写入的文本或网址'
+        text = self.ids.txt_input.text.strip()
+        if not text:
+            self.set_status('请先输入要写入的内容', 'err')
             return
         app = App.get_running_app()
-        app.nfc.arm_write(text=txt, url=url)
+        nfc = getattr(app, 'nfc', None)
+        if not getattr(app, 'nfc_ready', False) or nfc is None:
+            self.set_status('NFC 不可用，无法写入', 'err')
+            return
+        if text.startswith('http://') or text.startswith('https://'):
+            nfc.arm_write(url=text)
+        else:
+            nfc.arm_write(text=text)
+
+    def copy_result(self):
+        try:
+            Clipboard.copy(self.output_text or '')
+            self.set_status('已复制到剪贴板', 'ok')
+        except Exception:
+            self.set_status('复制失败', 'err')
+
+    def show_log(self):
+        try:
+            app = App.get_running_app()
+            content = BoxLayout(orientation='vertical', padding=dp(8), spacing=dp(6))
+            sc = ScrollView(bar_width=dp(3))
+            lbl = Label(text='\n'.join(LOG_LINES[-150:]) or '(暂无日志)',
+                        size_hint_y=None,
+                        font_name=getattr(app, 'font_name', 'Roboto'),
+                        font_size=dp(11),
+                        color=(0.85, 0.88, 0.94, 1),
+                        text_size=(dp(300), None),
+                        halign='left', valign='top')
+            lbl.bind(texture_size=lambda inst, val:
+                     setattr(inst, 'height', val[1]))
+            sc.add_widget(lbl)
+            content.add_widget(sc)
+            Popup(title=' 日志 ', content=content, size_hint=(0.94, 0.8)).open()
+        except Exception:
+            log_exc('打开日志窗口失败')
+            self.set_status('日志窗口打开失败', 'err')
 
 
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 class NfcApp(App):
-    title = 'NFC 助手'
+    title = 'NFC Helper'
+    font_name = StringProperty('Roboto')
 
     def build(self):
-        self.root_widget = Builder.load_string(KV)
-        self.nfc = NfcManager(self.on_nfc_event)
+        log('===== 应用启动 =====')
+        try:
+            self.font_name = register_cjk_font()
+        except Exception:
+            log_exc('字体注册失败')
 
-        if not ANDROID:
-            self.root_widget.status = '演示模式: 请打包为 APK 后在安卓手机上运行'
-            self.root_widget.output = ('桌面环境没有 NFC 硬件。\n\n'
-                                       '使用 README.md 中的步骤打包 APK, '
-                                       '安装到安卓手机即可读写 NFC 标签。')
-        elif not self.nfc.is_available():
-            self.root_widget.status = 'NFC 未开启: 请到系统设置打开 NFC'
-        else:
-            self.root_widget.status = '读取模式: 请贴近 NFC 标签'
+        try:
+            Window.softinput_mode = 'below_target'
+            Window.bind(on_keyboard=self._on_keyboard)
+        except Exception:
+            log_exc('Window 设置失败')
+
+        self.nfc = None
+        self.nfc_ready = False
+        try:
+            self.nfc = NfcManager(self.on_nfc_event)
+        except Exception:
+            log_exc('创建 NfcManager 失败')
+
+        try:
+            # 注意: Builder.load_string() 在 KV 只含 <Root>: 类规则时返回 None,
+            # 必须先注册规则再显式实例化 Root —— 这正是旧版启动闪退的原因
+            Builder.load_string(KV)
+            self.root_widget = Root()
+        except Exception:
+            log_exc('界面加载失败')
+            self.root_widget = self._fallback_ui()
         return self.root_widget
 
+    def _fallback_ui(self):
+        """界面加载失败时的纯文本兜底, 保证用户能看见错误而不是闪退"""
+        box = BoxLayout(orientation='vertical', padding=dp(16))
+        lbl = Label(text='界面加载失败，请把这段内容反馈：\n\n%s'
+                         % traceback.format_exc()[-1500:],
+                    font_name=self.font_name, font_size=dp(12),
+                    color=(1, 0.7, 0.7, 1), halign='left', valign='top')
+        lbl.bind(size=lambda inst, val: setattr(inst, 'text_size', val))
+        box.add_widget(lbl)
+        return box
+
     def on_start(self):
-        if ANDROID and self.nfc.is_available():
-            self.nfc.start()
+        # 界面先显示, 再做安卓侧初始化; 失败只提示, 不闪退
+        try:
+            self._boot_android()
+        except Exception:
+            log_exc('启动流程异常')
+            try:
+                self.root_widget.set_status('启动失败（详见日志）', 'err')
+            except Exception:
+                pass
+
+    def _boot_android(self):
+        root = self.root_widget
+        if not IS_ANDROID:
+            root.set_status('桌面演示模式（装到手机上才能读写 NFC）', 'info')
+            root.output_text = ('当前在电脑上运行，没有 NFC 硬件。\n\n'
+                                '把 APK 装到手机上并打开 NFC 即可读写标签。')
+            return
+
+        err = _init_android_bridge()
+        if err:
+            root.set_status('安卓环境初始化失败（点“日志”查看详情）', 'err')
+            root.output_text = err[-900:]
+            return
+
+        if self.nfc is None:
+            root.set_status('NFC 模块未能创建（点“日志”查看详情）', 'err')
+            return
+
+        ok, err = self.nfc.init()
+        if not ok:
+            root.set_status('NFC 初始化失败（点“日志”查看详情）', 'err')
+            root.output_text = (err or '')[-900:]
+            return
+
+        if not self.nfc.has_hardware():
+            root.set_status('这台手机没有 NFC 硬件', 'err')
+            root.output_text = '系统未提供 NFC 适配器。'
+            return
+
+        self.nfc_ready = True
+        self.nfc.start()
+        if self.nfc.is_enabled():
+            root.set_status('NFC 已就绪：把标签贴到手机背面', 'ok')
+            root.output_text = ('等待 NFC 标签…\n\n'
+                                '• 读取模式：贴近即可读出 UID 与内容\n'
+                                '• 写入模式：输入内容后贴近标签写入')
+        else:
+            root.set_status('NFC 未开启：请到系统设置打开 NFC', 'err')
+            root.output_text = ('系统 NFC 开关处于关闭状态。\n'
+                                '请下拉通知栏，或进入「设置 → 连接 → NFC」开启。')
+
+    def on_pause(self):
+        return True
+
+    def on_resume(self):
+        try:
+            if self.nfc_ready and self.nfc is not None:
+                self.nfc.start()
+                self.root_widget.set_status(
+                    'NFC 已恢复：把标签贴到手机背面', 'ok')
+        except Exception:
+            log_exc('恢复时重启前景调度失败')
 
     def on_stop(self):
-        if ANDROID:
-            self.nfc.stop()
+        try:
+            if self.nfc is not None:
+                self.nfc.stop()
+        except Exception:
+            pass
+        log('===== 应用退出 =====')
 
-    # ---- NFC 事件回调 (子线程/主线程都可能触发) ----
+    def _on_keyboard(self, window, key, *largs):
+        # 安卓返回键 (键值 27): 写入模式下先回到读取模式
+        if key == 27:
+            try:
+                if self.root_widget.write_mode:
+                    self.root_widget.set_mode('read')
+                    return True
+            except Exception:
+                pass
+        return False
+
+    # ---- NFC 事件回调 (可能来自非主线程) ----
     def on_nfc_event(self, event):
         def _apply():
             root = self.root_widget
-            if event.get('event') == 'read':
-                root.status = '读取成功'
-                lines = ['标签 UID: %s' % event.get('uid', '')]
-                for i, (rtype, content) in enumerate(event.get('records', []), 1):
-                    lines.append('')
-                    lines.append('记录 %d [%s]' % (i, rtype))
+            kind = event.get('event')
+            if kind == 'read':
+                root.result_title = '读取结果'
+                root.set_status('读取成功 ✔', 'ok')
+                lines = ['标签 UID: %s' % event.get('uid', '—'), '']
+                if event.get('tech'):
+                    lines += ['支持技术: %s' % event['tech'], '']
+                recs = event.get('records', [])
+                if not recs:
+                    lines.append('（标签内没有 NDEF 数据）')
+                for i, item in enumerate(recs, 1):
+                    rtype, content = item
+                    lines.append('[%d] %s' % (i, rtype))
                     lines.append(content)
-                root.output = '\n'.join(lines)
-            elif event.get('event') == 'write':
-                root.status = '写入成功 ✔'
-                root.output = '标签 UID: %s\n%s' % (event.get('uid', ''),
-                                                    event.get('message', ''))
-            elif event.get('event') == 'error':
-                root.status = '出错: %s' % event.get('message', '')
+                    lines.append('')
+                root.output_text = '\n'.join(lines).strip()
+            elif kind == 'write':
+                root.result_title = '写入记录'
+                root.set_status('写入成功 ✔', 'ok')
+                root.output_text = ('标签 UID: %s\n\n%s'
+                                    % (event.get('uid', '—'),
+                                       event.get('message', '')))
+            elif kind == 'error':
+                root.set_status('出错：%s' % event.get('message', ''), 'err')
             else:
-                root.status = event.get('message', '')
+                root.set_status(event.get('message', ''), 'info')
 
-        # 保证 UI 更新在主线程执行
-        from kivy.clock import Clock
         Clock.schedule_once(lambda dt: _apply(), 0)
 
 
+def main():
+    try:
+        NfcApp().run()
+    except Exception:
+        log_exc('主循环异常退出')
+        raise
+
+
 if __name__ == '__main__':
-    NfcApp().run()
+    main()
